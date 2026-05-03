@@ -11,10 +11,7 @@ jobs:
   backend-smoke:
     runs-on: ubuntu-latest
     env:
-      # Self-contained: the test script and backend share this dummy key for
-      # request authentication.  No real secret needed — both sides are in CI.
       EXTERNAL_APP_API_KEY: ci-eval-key
-      # The Gemini key is the ONLY real secret required.
       RESXIV_GEMINI_API_KEY: ${{ secrets.RESXIV_GEMINI_API_KEY }}
       BACKEND_BASE_URL: http://127.0.0.1:8000
       BACKEND_EVAL_MANIFEST: .github/eval-fixtures/backend/smoke_manifest.jsonl
@@ -37,6 +34,13 @@ jobs:
             exit 1
           fi
 
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq redis-server poppler-utils tesseract-ocr libcairo2-dev
+          sudo systemctl start redis-server
+          redis-cli ping
+
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
@@ -45,19 +49,18 @@ jobs:
       - name: Set up uv
         uses: astral-sh/setup-uv@v4
 
-      - name: Patch out saraldocling git dependency and create stub
+      - name: Patch out saraldocling and install dependencies
         shell: bash
         run: |
-          # ── 1. Remove saraldocling from pyproject.toml ──────────────────────
           cd backend
+
+          # ── Remove saraldocling (repo is 404) from pyproject.toml ─────────
           sed -i '/"saraldocling\[cpu\]"/d' pyproject.toml
           sed -i '/^\[tool\.uv\.sources\]/,$ { /saraldocling/d }' pyproject.toml
 
-          # ── 2. Create a stub saraldocling package ───────────────────────────
-          # The real package provides parse_pdf(ParseConfig) -> ParseResult.
-          # This stub uses PyMuPDF (already in deps) for basic text + image
-          # extraction — enough for the CI eval pipeline.
+          # ── Create a stub saraldocling package ────────────────────────────
           mkdir -p /tmp/saraldocling_stub/saraldocling
+
           cat > /tmp/saraldocling_stub/pyproject.toml << 'STUBTOML'
           [project]
           name = "saraldocling"
@@ -127,27 +130,21 @@ jobs:
               )
           STUBPY
 
-          echo "✓ saraldocling stub created"
-
-      - name: Install backend dependencies
-        working-directory: backend
-        run: |
-          uv pip install /tmp/saraldocling_stub --python .venv/bin/python 2>/dev/null || true
+          # ── Install: uv sync first (creates venv), then inject stub ──────
           uv sync
+          uv pip install /tmp/saraldocling_stub --python .venv/bin/python
+
+          echo "✓ Dependencies installed with saraldocling stub"
 
       - name: Generate dummy Firebase service account
         shell: bash
         run: |
-          # Generate a throwaway RSA private key so the Firebase Admin SDK
-          # can initialise without a real service account.  All Firestore
-          # calls are wrapped in try/except and will fail gracefully.
           openssl genpkey -algorithm RSA -out /tmp/ci_dummy_key.pem \
             -pkeyopt rsa_keygen_bits:2048 2>/dev/null
 
-          # Escape the PEM for JSON (newlines → literal \n)
           ESCAPED_KEY=$(awk '{printf "%s\\n", $0}' /tmp/ci_dummy_key.pem)
 
-          cat > backend/firebase_service_account.json <<JSONEOF
+          cat > backend/firebase_service_account.json << JSONEOF
           {
             "type": "service_account",
             "project_id": "ci-dummy-project",
@@ -164,24 +161,35 @@ jobs:
           JSONEOF
 
           rm /tmp/ci_dummy_key.pem
-          echo "✓ Dummy Firebase service account written"
+
+          # Validate the JSON is parseable
+          python3 -c "import json; json.load(open('backend/firebase_service_account.json'))"
+          echo "✓ Dummy Firebase service account written and validated"
 
       - name: Start backend server
         working-directory: backend
         shell: bash
         run: |
           nohup uv run uvicorn app.main:app --host 127.0.0.1 --port 8000 > ../backend-server.log 2>&1 &
+          echo "Server PID: $!"
+          # Give it a few seconds to either start or crash
+          sleep 10
+          echo "=== Early server log ==="
+          cat ../backend-server.log || true
+          echo "========================"
 
       - name: Wait for backend health
         shell: bash
         run: |
           for i in {1..60}; do
             if curl -fsS http://127.0.0.1:8000/health > /dev/null; then
+              echo "Backend is healthy after $((i*5)) seconds"
               exit 0
             fi
             sleep 5
           done
           echo "Backend failed to become healthy"
+          echo "=== Full server log ==="
           cat backend-server.log || true
           exit 1
 
