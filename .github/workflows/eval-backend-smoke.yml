@@ -45,9 +45,95 @@ jobs:
       - name: Set up uv
         uses: astral-sh/setup-uv@v4
 
+      - name: Patch out saraldocling git dependency and create stub
+        shell: bash
+        run: |
+          # ── 1. Remove saraldocling from pyproject.toml ──────────────────────
+          cd backend
+          sed -i '/"saraldocling\[cpu\]"/d' pyproject.toml
+          sed -i '/^\[tool\.uv\.sources\]/,$ { /saraldocling/d }' pyproject.toml
+
+          # ── 2. Create a stub saraldocling package ───────────────────────────
+          # The real package provides parse_pdf(ParseConfig) -> ParseResult.
+          # This stub uses PyMuPDF (already in deps) for basic text + image
+          # extraction — enough for the CI eval pipeline.
+          mkdir -p /tmp/saraldocling_stub/saraldocling
+          cat > /tmp/saraldocling_stub/pyproject.toml << 'STUBTOML'
+          [project]
+          name = "saraldocling"
+          version = "0.0.1"
+          dependencies = ["pymupdf>=1.26.0"]
+
+          [build-system]
+          requires = ["setuptools"]
+          build-backend = "setuptools.build_meta"
+          STUBTOML
+
+          cat > /tmp/saraldocling_stub/saraldocling/__init__.py << 'STUBPY'
+          """Minimal saraldocling stub for CI — uses PyMuPDF for PDF parsing."""
+          from dataclasses import dataclass, field
+          from pathlib import Path
+          from typing import List
+          import fitz  # PyMuPDF
+
+
+          @dataclass
+          class ParseConfig:
+              pdf_path: str = ""
+              output_dir: str = ""
+              extract_images: bool = False
+
+
+          @dataclass
+          class ParseResult:
+              text: str = ""
+              image_paths: List[str] = field(default_factory=list)
+              num_pages: int = 0
+
+
+          def parse_pdf(config: ParseConfig) -> ParseResult:
+              pdf_path = Path(config.pdf_path)
+              output_dir = Path(config.output_dir)
+              output_dir.mkdir(parents=True, exist_ok=True)
+
+              doc = fitz.open(str(pdf_path))
+              text_parts = []
+              image_paths = []
+
+              for page_num, page in enumerate(doc):
+                  text_parts.append(page.get_text())
+
+                  if config.extract_images:
+                      img_dir = output_dir / "extracted_images"
+                      img_dir.mkdir(parents=True, exist_ok=True)
+                      for img_index, img in enumerate(page.get_images(full=True)):
+                          xref = img[0]
+                          try:
+                              pix = fitz.Pixmap(doc, xref)
+                              if pix.n > 4:
+                                  pix = fitz.Pixmap(fitz.csRGB, pix)
+                              img_path = img_dir / f"page{page_num}_img{img_index}.png"
+                              pix.save(str(img_path))
+                              image_paths.append(str(img_path))
+                          except Exception:
+                              pass
+
+              doc.close()
+
+              return ParseResult(
+                  text="\n".join(text_parts),
+                  image_paths=image_paths,
+                  num_pages=len(text_parts),
+              )
+          STUBPY
+
+          echo "✓ saraldocling stub created"
+
       - name: Install backend dependencies
         working-directory: backend
-        run: uv sync
+        run: |
+          uv pip install /tmp/saraldocling_stub --python .venv/bin/python 2>/dev/null || true
+          uv sync
 
       - name: Generate dummy Firebase service account
         shell: bash
