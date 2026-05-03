@@ -544,3 +544,4 @@ Then open `http://localhost:3000`.
 - **Update this guide** if you add a new local dependency or setup step.
 - If you only need API smoke tests, you can run the backend API server alone without workers.
 - For full media pipelines (PDF → video, poster generation, audio), run the API server + all workers + all system dependencies.
+- lets test the workflow

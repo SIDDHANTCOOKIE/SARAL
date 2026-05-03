@@ -9,13 +9,9 @@ permissions:
 
 jobs:
   backend-smoke:
-    if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.fork == false }}
     runs-on: ubuntu-latest
     env:
-      # Self-contained: the test script and backend share this dummy key for
-      # request authentication.  No real secret needed — both sides are in CI.
       EXTERNAL_APP_API_KEY: ci-eval-key
-      # The Gemini key is the ONLY real secret required.
       RESXIV_GEMINI_API_KEY: ${{ secrets.RESXIV_GEMINI_API_KEY }}
       BACKEND_BASE_URL: http://127.0.0.1:8000
       BACKEND_EVAL_MANIFEST: .github/eval-fixtures/backend/smoke_manifest.jsonl
@@ -38,6 +34,13 @@ jobs:
             exit 1
           fi
 
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq redis-server poppler-utils tesseract-ocr libcairo2-dev
+          sudo systemctl start redis-server
+          redis-cli ping
+
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
@@ -46,23 +49,102 @@ jobs:
       - name: Set up uv
         uses: astral-sh/setup-uv@v4
 
-      - name: Install backend dependencies
-        working-directory: backend
-        run: uv sync --frozen
+      - name: Patch out saraldocling and install dependencies
+        shell: bash
+        run: |
+          cd backend
+
+          # ── Remove saraldocling (repo is 404) from pyproject.toml ─────────
+          sed -i '/"saraldocling\[cpu\]"/d' pyproject.toml
+          sed -i '/^\[tool\.uv\.sources\]/,$ { /saraldocling/d }' pyproject.toml
+
+          # ── Create a stub saraldocling package ────────────────────────────
+          mkdir -p /tmp/saraldocling_stub/saraldocling
+
+          cat > /tmp/saraldocling_stub/pyproject.toml << 'STUBTOML'
+          [project]
+          name = "saraldocling"
+          version = "0.0.1"
+          dependencies = ["pymupdf>=1.26.0"]
+
+          [build-system]
+          requires = ["setuptools"]
+          build-backend = "setuptools.build_meta"
+          STUBTOML
+
+          cat > /tmp/saraldocling_stub/saraldocling/__init__.py << 'STUBPY'
+          """Minimal saraldocling stub for CI — uses PyMuPDF for PDF parsing."""
+          from dataclasses import dataclass, field
+          from pathlib import Path
+          from typing import List
+          import fitz  # PyMuPDF
+
+
+          @dataclass
+          class ParseConfig:
+              pdf_path: str = ""
+              output_dir: str = ""
+              extract_images: bool = False
+
+
+          @dataclass
+          class ParseResult:
+              text: str = ""
+              image_paths: List[str] = field(default_factory=list)
+              num_pages: int = 0
+
+
+          def parse_pdf(config: ParseConfig) -> ParseResult:
+              pdf_path = Path(config.pdf_path)
+              output_dir = Path(config.output_dir)
+              output_dir.mkdir(parents=True, exist_ok=True)
+
+              doc = fitz.open(str(pdf_path))
+              text_parts = []
+              image_paths = []
+
+              for page_num, page in enumerate(doc):
+                  text_parts.append(page.get_text())
+
+                  if config.extract_images:
+                      img_dir = output_dir / "extracted_images"
+                      img_dir.mkdir(parents=True, exist_ok=True)
+                      for img_index, img in enumerate(page.get_images(full=True)):
+                          xref = img[0]
+                          try:
+                              pix = fitz.Pixmap(doc, xref)
+                              if pix.n > 4:
+                                  pix = fitz.Pixmap(fitz.csRGB, pix)
+                              img_path = img_dir / f"page{page_num}_img{img_index}.png"
+                              pix.save(str(img_path))
+                              image_paths.append(str(img_path))
+                          except Exception:
+                              pass
+
+              doc.close()
+
+              return ParseResult(
+                  text="\n".join(text_parts),
+                  image_paths=image_paths,
+                  num_pages=len(text_parts),
+              )
+          STUBPY
+
+          # ── Install: uv sync first (creates venv), then inject stub ──────
+          uv sync
+          uv pip install /tmp/saraldocling_stub --python .venv/bin/python
+
+          echo "✓ Dependencies installed with saraldocling stub"
 
       - name: Generate dummy Firebase service account
         shell: bash
         run: |
-          # Generate a throwaway RSA private key so the Firebase Admin SDK
-          # can initialise without a real service account.  All Firestore
-          # calls are wrapped in try/except and will fail gracefully.
           openssl genpkey -algorithm RSA -out /tmp/ci_dummy_key.pem \
             -pkeyopt rsa_keygen_bits:2048 2>/dev/null
 
-          # Escape the PEM for JSON (newlines → literal \n)
           ESCAPED_KEY=$(awk '{printf "%s\\n", $0}' /tmp/ci_dummy_key.pem)
 
-          cat > backend/firebase_service_account.json <<JSONEOF
+          cat > backend/firebase_service_account.json << JSONEOF
           {
             "type": "service_account",
             "project_id": "ci-dummy-project",
@@ -79,24 +161,35 @@ jobs:
           JSONEOF
 
           rm /tmp/ci_dummy_key.pem
-          echo "✓ Dummy Firebase service account written"
+
+          # Validate the JSON is parseable
+          python3 -c "import json; json.load(open('backend/firebase_service_account.json'))"
+          echo "✓ Dummy Firebase service account written and validated"
 
       - name: Start backend server
         working-directory: backend
         shell: bash
         run: |
           nohup uv run uvicorn app.main:app --host 127.0.0.1 --port 8000 > ../backend-server.log 2>&1 &
+          echo "Server PID: $!"
+          # Give it a few seconds to either start or crash
+          sleep 10
+          echo "=== Early server log ==="
+          cat ../backend-server.log || true
+          echo "========================"
 
       - name: Wait for backend health
         shell: bash
         run: |
           for i in {1..60}; do
             if curl -fsS http://127.0.0.1:8000/health > /dev/null; then
+              echo "Backend is healthy after $((i*5)) seconds"
               exit 0
             fi
             sleep 5
           done
           echo "Backend failed to become healthy"
+          echo "=== Full server log ==="
           cat backend-server.log || true
           exit 1
 
