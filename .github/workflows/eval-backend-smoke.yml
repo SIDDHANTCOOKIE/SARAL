@@ -12,7 +12,10 @@ jobs:
     if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.fork == false }}
     runs-on: ubuntu-latest
     env:
-      EXTERNAL_APP_API_KEY: ${{ secrets.EXTERNAL_APP_API_KEY }}
+      # Self-contained: the test script and backend share this dummy key for
+      # request authentication.  No real secret needed — both sides are in CI.
+      EXTERNAL_APP_API_KEY: ci-eval-key
+      # The Gemini key is the ONLY real secret required.
       RESXIV_GEMINI_API_KEY: ${{ secrets.RESXIV_GEMINI_API_KEY }}
       BACKEND_BASE_URL: http://127.0.0.1:8000
       BACKEND_EVAL_MANIFEST: .github/eval-fixtures/backend/smoke_manifest.jsonl
@@ -27,21 +30,13 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Validate required secrets
+      - name: Validate Gemini API key
         shell: bash
         run: |
-          missing=0
-          for key in EXTERNAL_APP_API_KEY RESXIV_GEMINI_API_KEY FIREBASE_SERVICE_ACCOUNT_JSON; do
-            if [ -z "${!key}" ]; then
-              echo "Missing required secret: $key"
-              missing=1
-            fi
-          done
-          if [ "$missing" -ne 0 ]; then
+          if [ -z "$RESXIV_GEMINI_API_KEY" ]; then
+            echo "::error::Missing required secret: RESXIV_GEMINI_API_KEY (your Gemini API key)"
             exit 1
           fi
-        env:
-          FIREBASE_SERVICE_ACCOUNT_JSON: ${{ secrets.FIREBASE_SERVICE_ACCOUNT_JSON }}
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -55,12 +50,36 @@ jobs:
         working-directory: backend
         run: uv sync --frozen
 
-      - name: Write Firebase service account file
+      - name: Generate dummy Firebase service account
         shell: bash
         run: |
-          printf '%s' "$FIREBASE_SERVICE_ACCOUNT_JSON" > backend/firebase_service_account.json
-        env:
-          FIREBASE_SERVICE_ACCOUNT_JSON: ${{ secrets.FIREBASE_SERVICE_ACCOUNT_JSON }}
+          # Generate a throwaway RSA private key so the Firebase Admin SDK
+          # can initialise without a real service account.  All Firestore
+          # calls are wrapped in try/except and will fail gracefully.
+          openssl genpkey -algorithm RSA -out /tmp/ci_dummy_key.pem \
+            -pkeyopt rsa_keygen_bits:2048 2>/dev/null
+
+          # Escape the PEM for JSON (newlines → literal \n)
+          ESCAPED_KEY=$(awk '{printf "%s\\n", $0}' /tmp/ci_dummy_key.pem)
+
+          cat > backend/firebase_service_account.json <<JSONEOF
+          {
+            "type": "service_account",
+            "project_id": "ci-dummy-project",
+            "private_key_id": "ci-dummy-key-id",
+            "private_key": "${ESCAPED_KEY}",
+            "client_email": "ci-dummy@ci-dummy-project.iam.gserviceaccount.com",
+            "client_id": "000000000000000000000",
+            "auth_uri": "https://accounts.google.com/o/oauth2/auth",
+            "token_uri": "https://oauth2.googleapis.com/token",
+            "auth_provider_x509_cert_url": "https://www.googleapis.com/oauth2/v1/certs",
+            "client_x509_cert_url": "https://www.googleapis.com/robot/v1/metadata/x509/ci-dummy%40ci-dummy-project.iam.gserviceaccount.com",
+            "universe_domain": "googleapis.com"
+          }
+          JSONEOF
+
+          rm /tmp/ci_dummy_key.pem
+          echo "✓ Dummy Firebase service account written"
 
       - name: Start backend server
         working-directory: backend
