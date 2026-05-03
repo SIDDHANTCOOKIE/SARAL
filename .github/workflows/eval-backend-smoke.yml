@@ -47,7 +47,7 @@ jobs:
 
       - name: Install backend dependencies
         working-directory: backend
-        run: uv sync --frozen
+        run: uv sync
 
       - name: Generate dummy Firebase service account
         shell: bash
